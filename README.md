@@ -70,6 +70,30 @@ After setting Telegram env variables, run the app and use:
 - `/alerts`
 - `/setalerts ratio=0.65 streak=2 rain=3 cooldown_h=24`
 
+### Webhook Setup
+
+Use webhook mode if you want Telegram to push updates to your server.
+
+Required env values:
+
+- `TELEGRAM_MODE=webhook`
+- `TELEGRAM_WEBHOOK_URL=https://your-domain/telegram/webhook`
+- `TELEGRAM_WEBHOOK_SECRET=your_secret` (recommended)
+
+How to create `TELEGRAM_WEBHOOK_SECRET`:
+
+- This secret is not provided by Telegram. You create it yourself.
+- Example:
+
+```bash
+openssl rand -hex 32
+```
+
+Webhook endpoint:
+
+- `POST /telegram/webhook`
+- Validates `X-Telegram-Bot-Api-Secret-Token` when `TELEGRAM_WEBHOOK_SECRET` is set
+
 ## Use Cases
 
 - Get notified when panel cleaning is likely needed
