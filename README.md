@@ -24,9 +24,9 @@ cp .env.example .env
 Update `.env` with your ShineMonitor credentials:
 
 - `SHINEMONITOR_BASE_URL`
-- `SHINEMONITOR_TOKEN`
-- `SHINEMONITOR_SECRET`
+- `SHINEMONITOR_USERNAME`, `SHINEMONITOR_PASSWORD`, `SHINEMONITOR_COMPANY_KEY` (plaintext password; auth matches the legacy script: `action='&action=auth&usr='+usr+'&company-key='+key`, then `sign=sha1(salt+sha1(pwd)+action)` with `salt=int(round(time*1000))`)
 - `SHINEMONITOR_PLANT_ID`
+- Optional: `SHINEMONITOR_AUTH_ACTION` — `auth` (default) or `authEmail` for the alternate login endpoint
 
 Optional but useful:
 
