@@ -623,9 +623,9 @@ def _summarize_day(
     completion_ratio = min(max(elapsed_hours / daylight_hours, 0.0), 1.0)
 
     daylight_points = [(ts, val) for ts, val in points if sunrise <= ts <= sunset]
-    non_zero_daylight = sum(1 for _, val in daylight_points if val >= MIN_NON_ZERO_KW)
-    energy_kwh = _integrate_energy_kwh(daylight_points)
-    peak_kw = max((val for _, val in daylight_points), default=0.0)
+    non_zero_daylight = sum(1 for _, val in points if val >= MIN_NON_ZERO_KW)
+    energy_kwh = _integrate_energy_kwh(points)
+    peak_kw = max((val for _, val in points), default=0.0)
 
     latest_timestamp: datetime | None = points[-1][0] if points else None
     current_kw: float | None = points[-1][1] if points else None
@@ -641,7 +641,7 @@ def _summarize_day(
         quality = "missing"
     elif day == now_local.date() and completion_ratio < 0.2:
         quality = "early"
-    elif len(daylight_points) < 12 and completion_ratio > 0.6:
+    elif len(points) < 12 and completion_ratio > 0.6:
         quality = "sparse"
 
     return DayEvaluation(
