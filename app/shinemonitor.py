@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import os
+import random
 import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -13,8 +15,19 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+log = logging.getLogger(__name__)
+
 PLANT_ACTION = "queryPlantActiveOuputPowerOneDay"
 _CRED_SAFETY_MARGIN_S = 60.0
+
+_RETRYABLE_EXC: tuple[type[BaseException], ...] = (
+    httpx.TransportError,
+    httpx.ReadTimeout,
+    httpx.ConnectTimeout,
+    httpx.PoolTimeout,
+)
+_RETRY_STATUSES = {500, 502, 503, 504}
+_RETRY_MAX_ATTEMPTS = 3
 
 # Match browser requests to web.shinemonitor.com (Referer / UA / client hints).
 _SHINEMONITOR_BROWSER_HEADERS: Dict[str, str] = {
@@ -168,10 +181,39 @@ async def _ensure_shinemonitor_credentials(
             "secret": str(secret),
             "expires_at": expires_at,
         }
+        log.info("shinemonitor token refreshed expire=%ss", expire)
         return _cred_cache["token"], _cred_cache["secret"]
 
 
-async def call_shinemonitor_api(date_override: str | None = None) -> Dict[str, Any]:
+async def _retryable_get(
+    client: httpx.AsyncClient, url: str, *, headers: dict[str, str]
+) -> httpx.Response:
+    last_exc: BaseException | None = None
+    for attempt in range(_RETRY_MAX_ATTEMPTS):
+        try:
+            response = await client.get(url, headers=headers)
+            if response.status_code in _RETRY_STATUSES and attempt < _RETRY_MAX_ATTEMPTS - 1:
+                raise httpx.HTTPStatusError(
+                    "retryable", request=response.request, response=response
+                )
+            response.raise_for_status()
+            return response
+        except _RETRYABLE_EXC + (httpx.HTTPStatusError,) as exc:
+            if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code not in _RETRY_STATUSES:
+                raise
+            last_exc = exc
+            if attempt >= _RETRY_MAX_ATTEMPTS - 1:
+                raise
+            log.warning("shinemonitor retry attempt=%d after %r", attempt, exc)
+            await asyncio.sleep(0.5 * (2 ** attempt) + random.uniform(0, 0.25))
+    # Unreachable, but keep typing happy.
+    raise last_exc if last_exc else RuntimeError("retry loop exited without response")
+
+
+async def call_shinemonitor_api(
+    date_override: str | None = None,
+    client: httpx.AsyncClient | None = None,
+) -> Dict[str, Any]:
     """Call the ShineMonitor plant API using credentials from action=auth."""
     base_url = os.getenv("SHINEMONITOR_BASE_URL")
     username = (os.getenv("SHINEMONITOR_USERNAME") or "").strip()
@@ -203,38 +245,84 @@ async def call_shinemonitor_api(date_override: str | None = None) -> Dict[str, A
 
     base_url = _normalize_public_base_url(base_url)
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    if client is None:
+        async with httpx.AsyncClient(timeout=timeout) as owned_client:
+            return await _call_with_client(
+                owned_client,
+                base_url=base_url,
+                username=username,
+                password=password,
+                company_key=company_key,
+                auth_action=auth_action,
+                plant_id=str(plant_id),
+                query_date=query_date,
+                i18n=i18n,
+                lang=lang,
+            )
+
+    return await _call_with_client(
+        client,
+        base_url=base_url,
+        username=username,
+        password=password,
+        company_key=company_key,
+        auth_action=auth_action,
+        plant_id=str(plant_id),
+        query_date=query_date,
+        i18n=i18n,
+        lang=lang,
+    )
+
+
+async def _call_with_client(
+    client: httpx.AsyncClient,
+    *,
+    base_url: str,
+    username: str,
+    password: str,
+    company_key: str,
+    auth_action: str,
+    plant_id: str,
+    query_date: str,
+    i18n: str,
+    lang: str,
+) -> Dict[str, Any]:
+    global _cred_cache
+
+    try:
         token, secret = await _ensure_shinemonitor_credentials(
-            client,
-            base_url,
-            username,
-            password,
-            company_key,
-            auth_action,
+            client, base_url, username, password, company_key, auth_action,
         )
-        signed_url = _build_plant_signed_url(
-            base_url=base_url,
-            secret=secret,
-            token=token,
-            plant_id=str(plant_id),
-            query_date=query_date,
-            i18n=i18n,
-            lang=lang,
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code not in _RETRY_STATUSES:
+            raise
+        log.warning("shinemonitor auth %d; clearing cred cache and retrying once", exc.response.status_code)
+        _cred_cache = None
+        token, secret = await _ensure_shinemonitor_credentials(
+            client, base_url, username, password, company_key, auth_action,
         )
-        response = await client.get(
-            signed_url,
-            headers=_SHINEMONITOR_BROWSER_HEADERS,
-        )
-        response.raise_for_status()
 
-        content_type = response.headers.get("content-type", "")
-        if "application/json" in content_type:
-            payload: Any = response.json()
-        else:
-            payload = {"raw_text": response.text}
+    signed_url = _build_plant_signed_url(
+        base_url=base_url,
+        secret=secret,
+        token=token,
+        plant_id=plant_id,
+        query_date=query_date,
+        i18n=i18n,
+        lang=lang,
+    )
+    response = await _retryable_get(
+        client, signed_url, headers=_SHINEMONITOR_BROWSER_HEADERS,
+    )
 
-        return {
-            "status_code": response.status_code,
-            "url": str(response.url),
-            "payload": payload,
-        }
+    content_type = response.headers.get("content-type", "")
+    if "application/json" in content_type:
+        payload: Any = response.json()
+    else:
+        payload = {"raw_text": response.text}
+
+    return {
+        "status_code": response.status_code,
+        "url": str(response.url),
+        "payload": payload,
+    }
