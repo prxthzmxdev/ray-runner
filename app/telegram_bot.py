@@ -1,22 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
+import secrets as _secrets
 from typing import Any
 
 import httpx
 
 from app.data_store import set_setting
-from app.solar_advisor import (
-    build_alerts_text,
-    build_history_text,
-    build_quality_text,
-    build_report_text,
-    build_run_text,
-    build_status_text,
-    build_today_text,
-    build_weather_text,
-)
+from app.solar_advisor import build_alerts_text, build_command_text
+
+log = logging.getLogger(__name__)
 
 
 class TelegramBotService:
@@ -33,6 +28,10 @@ class TelegramBotService:
         self._task: asyncio.Task[None] | None = None
         self._poll_timeout = int(os.getenv("TELEGRAM_POLL_TIMEOUT", "25"))
         self._request_timeout = float(os.getenv("TELEGRAM_REQUEST_TIMEOUT", "30"))
+        self._inflight: set[asyncio.Task[None]] = set()
+        self._handler_semaphore = asyncio.Semaphore(
+            int(os.getenv("TELEGRAM_HANDLER_CONCURRENCY", "4"))
+        )
 
     @property
     def enabled(self) -> bool:
@@ -45,7 +44,7 @@ class TelegramBotService:
     def validate_webhook_secret(self, received_secret: str | None) -> bool:
         if not self._webhook_secret:
             return True
-        return received_secret == self._webhook_secret
+        return _secrets.compare_digest(self._webhook_secret, received_secret or "")
 
     async def start(self) -> None:
         if not self.enabled or self._running:
@@ -61,14 +60,15 @@ class TelegramBotService:
 
     async def stop(self) -> None:
         self._running = False
-        if not self._task:
-            return
-        self._task.cancel()
-        try:
-            await self._task
-        except asyncio.CancelledError:
-            pass
-        self._task = None
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+        if self._inflight:
+            await asyncio.gather(*self._inflight, return_exceptions=True)
 
     async def handle_webhook_update(self, update: dict[str, Any]) -> None:
         if not self.enabled:
@@ -135,11 +135,25 @@ class TelegramBotService:
                         update_id = update.get("update_id")
                         if isinstance(update_id, int):
                             offset = update_id + 1
-                        await self._handle_update(client, update)
+                        task = asyncio.create_task(
+                            self._handle_update_guarded(client, update)
+                        )
+                        self._inflight.add(task)
+                        task.add_done_callback(self._inflight.discard)
                 except asyncio.CancelledError:
                     raise
-                except Exception:  # noqa: BLE001
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("poll loop error offset=%s: %r", offset, exc)
                     await asyncio.sleep(3)
+
+    async def _handle_update_guarded(
+        self, client: httpx.AsyncClient, update: dict[str, Any]
+    ) -> None:
+        async with self._handler_semaphore:
+            try:
+                await self._handle_update(client, update)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("telegram handler error: %r", exc)
 
     async def _handle_update(self, client: httpx.AsyncClient, update: dict[str, Any]) -> None:
         message = update.get("message") or update.get("edited_message")
@@ -161,21 +175,21 @@ class TelegramBotService:
         command, arg = _parse_command(text)
         verbose = _is_verbose_arg(arg)
         if command == "status":
-            reply = await build_status_text(verbose=verbose)
+            reply = await build_command_text("status", verbose=verbose, force_refresh=True)
         elif command == "today":
-            reply = await build_today_text(verbose=verbose)
+            reply = await build_command_text("today", verbose=verbose, force_refresh=True)
         elif command == "run":
-            reply = await build_run_text()
+            reply = await build_command_text("run", force_refresh=True)
         elif command == "report":
-            reply = await build_report_text(days=7, force_refresh=True)
+            reply = await build_command_text("report", days=7, force_refresh=True)
         elif command == "history":
             days = _safe_days_arg(arg, default=7)
-            reply = await build_history_text(days=days, verbose=verbose)
+            reply = await build_command_text("history", days=days, verbose=verbose)
         elif command == "weather":
-            reply = await build_weather_text(verbose=verbose)
+            reply = await build_command_text("weather", verbose=verbose)
         elif command == "quality":
             days = _safe_days_arg(arg, default=7)
-            reply = await build_quality_text(days=days, verbose=verbose)
+            reply = await build_command_text("quality", days=days, verbose=verbose)
         elif command == "alerts":
             reply = await build_alerts_text()
         elif command == "setalerts":
