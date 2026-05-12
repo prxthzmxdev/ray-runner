@@ -1,3 +1,5 @@
+import logging
+import os
 from datetime import date as date_type
 
 from fastapi import FastAPI, Header, HTTPException
@@ -13,6 +15,10 @@ telegram_bot = TelegramBotService()
 
 @app.on_event("startup")
 async def startup_event() -> None:
+    logging.basicConfig(
+        level=os.getenv("LOG_LEVEL", "INFO"),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
     await ensure_db()
     await telegram_bot.start()
 
