@@ -2,17 +2,21 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import statistics
+import time as _time
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
-from typing import Any
+from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
 import httpx
 
 from app.data_store import get_day_record, get_settings, upsert_day_error, upsert_day_success
 from app.shinemonitor import call_shinemonitor_api
+
+log = logging.getLogger(__name__)
 
 DEFAULT_TZ = "Asia/Kolkata"
 WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
@@ -107,23 +111,26 @@ async def get_snapshot(
     force_today_refresh: bool = False,
 ) -> dict[str, Any]:
     days = max(1, min(days, 30))
-    cache_age_seconds = int(os.getenv("SNAPSHOT_CACHE_SECONDS", "90"))
+    if force_today_refresh:
+        ttl = int(os.getenv("SNAPSHOT_FORCE_TTL_SECONDS", "60"))
+    else:
+        ttl = int(os.getenv("SNAPSHOT_CACHE_SECONDS", "90"))
     now_utc = datetime.now(tz=ZoneInfo("UTC"))
 
-    if use_cache and not force_today_refresh:
+    if use_cache:
         cached = _snapshot_cache.get(days)
-        if cached and (now_utc - cached[0]).total_seconds() <= cache_age_seconds:
+        if cached and (now_utc - cached[0]).total_seconds() <= ttl:
             return cached[1]
 
     async with _snapshot_cache_lock:
-        if use_cache and not force_today_refresh:
+        if use_cache:
             cached = _snapshot_cache.get(days)
-            if cached and (now_utc - cached[0]).total_seconds() <= cache_age_seconds:
+            now_utc = datetime.now(tz=ZoneInfo("UTC"))
+            if cached and (now_utc - cached[0]).total_seconds() <= ttl:
                 return cached[1]
 
         snapshot = await _build_snapshot(days, force_today_refresh=force_today_refresh)
-        if not force_today_refresh:
-            _snapshot_cache[days] = (datetime.now(tz=ZoneInfo("UTC")), snapshot)
+        _snapshot_cache[days] = (datetime.now(tz=ZoneInfo("UTC")), snapshot)
         return snapshot
 
 
@@ -137,8 +144,51 @@ async def get_alert_settings() -> dict[str, float]:
     }
 
 
-async def build_status_text(verbose: bool = False) -> str:
-    snapshot = await get_snapshot(days=7, use_cache=False, force_today_refresh=True)
+async def build_command_text(
+    command: Literal["status", "today", "history", "weather", "quality", "run", "report"],
+    *,
+    days: int = 7,
+    verbose: bool = False,
+    force_refresh: bool = False,
+) -> str:
+    if command == "report":
+        days = max(1, min(days, 30))
+        status = await build_command_text("status", verbose=False, force_refresh=force_refresh)
+        history = await build_command_text(
+            "history", days=days, verbose=False, force_refresh=force_refresh,
+        )
+        quality = await build_command_text(
+            "quality", days=days, verbose=False, force_refresh=force_refresh,
+        )
+        return f"{status}\n\n{history}\n\n{quality}"
+
+    if command in ("status", "today", "weather", "run"):
+        snapshot_days = 7
+    else:
+        snapshot_days = max(1, min(days, 30))
+
+    snapshot = await get_snapshot(
+        days=snapshot_days,
+        use_cache=not force_refresh,
+        force_today_refresh=force_refresh,
+    )
+
+    if command == "status":
+        return _render_status(snapshot, verbose=verbose)
+    if command == "today":
+        return _render_today(snapshot, verbose=verbose)
+    if command == "history":
+        return _render_history(snapshot, days=snapshot_days, verbose=verbose)
+    if command == "weather":
+        return _render_weather(snapshot, verbose=verbose)
+    if command == "quality":
+        return _render_quality(snapshot, days=snapshot_days, verbose=verbose)
+    if command == "run":
+        return _render_run(snapshot)
+    raise ValueError(f"unknown command: {command}")
+
+
+def _render_status(snapshot: dict[str, Any], verbose: bool = False) -> str:
     today = snapshot["today"]
     rec = snapshot["recommendation"]
     weather = today.get("weather", {})
@@ -193,8 +243,7 @@ async def build_status_text(verbose: bool = False) -> str:
     )
 
 
-async def build_today_text(verbose: bool = False) -> str:
-    snapshot = await get_snapshot(days=7, use_cache=False, force_today_refresh=True)
+def _render_today(snapshot: dict[str, Any], verbose: bool = False) -> str:
     today = snapshot["today"]
     rec = snapshot["recommendation"]
     sunrise = _iso_to_local_display(today.get("sunrise"))
@@ -254,9 +303,8 @@ async def build_today_text(verbose: bool = False) -> str:
     )
 
 
-async def build_history_text(days: int = 7, verbose: bool = False) -> str:
+def _render_history(snapshot: dict[str, Any], days: int = 7, verbose: bool = False) -> str:
     days = max(1, min(days, 30))
-    snapshot = await get_snapshot(days=days, use_cache=True)
     rec = snapshot["recommendation"]
     history_days = snapshot["history"][:days]
     valid_days = [d for d in history_days if not d.get("error")]
@@ -341,8 +389,7 @@ async def build_history_text(days: int = 7, verbose: bool = False) -> str:
     )
 
 
-async def build_weather_text(verbose: bool = False) -> str:
-    snapshot = await get_snapshot(days=7, use_cache=True)
+def _render_weather(snapshot: dict[str, Any], verbose: bool = False) -> str:
     today = snapshot["today"]
     weather = today.get("weather", {})
     sunrise = _iso_to_local_display(today.get("sunrise"))
@@ -379,8 +426,7 @@ async def build_weather_text(verbose: bool = False) -> str:
     )
 
 
-async def build_quality_text(days: int = 7, verbose: bool = False) -> str:
-    snapshot = await get_snapshot(days=days, use_cache=True)
+def _render_quality(snapshot: dict[str, Any], days: int = 7, verbose: bool = False) -> str:
     history = snapshot["history"][:days]
     missing = [d for d in history if d.get("error")]
     sparse = [d for d in history if d.get("quality") == "sparse"]
@@ -427,15 +473,7 @@ async def build_quality_text(days: int = 7, verbose: bool = False) -> str:
     )
 
 
-async def build_report_text(days: int = 7, force_refresh: bool = False) -> str:
-    status = await build_status_text(verbose=False) if not force_refresh else await _build_status_uncached()
-    history = await build_history_text(days=days, verbose=False) if not force_refresh else await _build_history_uncached(days=days)
-    quality = await build_quality_text(days=days, verbose=False)
-    return f"{status}\n\n{history}\n\n{quality}"
-
-
-async def build_run_text() -> str:
-    snapshot = await get_snapshot(days=7, use_cache=False)
+def _render_run(snapshot: dict[str, Any]) -> str:
     today = snapshot["today"]
     rec = snapshot["recommendation"]
     return _render_template(
@@ -481,21 +519,27 @@ async def _build_snapshot(days: int, force_today_refresh: bool = False) -> dict[
     now_local = datetime.now(tz=tz)
     today = now_local.date()
     day_list = [today - timedelta(days=offset) for offset in range(days)]
+    start_time = _time.perf_counter()
 
-    weather_map = await _fetch_weather_range(min(day_list), max(day_list), tz_name=tz_name)
-    evals = await asyncio.gather(
-        *[
-            _build_day_evaluation(
-                d,
-                weather_map.get(d.isoformat()),
-                force_refresh_today=force_today_refresh,
-            )
-            for d in day_list
-        ]
-    )
+    sm_timeout = float(os.getenv("SHINEMONITOR_TIMEOUT", "20"))
+    timeout = httpx.Timeout(connect=5.0, read=sm_timeout, write=sm_timeout, pool=sm_timeout)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        weather_map, upcoming_rain = await _fetch_weather_range(
+            min(day_list), max(day_list), tz_name=tz_name, client=client,
+        )
+        evals = await asyncio.gather(
+            *[
+                _build_day_evaluation(
+                    d,
+                    weather_map.get(d.isoformat()),
+                    force_refresh_today=force_today_refresh,
+                    client=client,
+                )
+                for d in day_list
+            ]
+        )
     evals_sorted = sorted(evals, key=lambda item: item.day, reverse=True)
     today_eval = next((item for item in evals_sorted if item.day == today), evals_sorted[0])
-    upcoming_rain = await _fetch_upcoming_rain_mm(tz_name)
     alert_settings = await get_alert_settings()
 
     recommendation = _build_recommendation(
@@ -506,7 +550,7 @@ async def _build_snapshot(days: int, force_today_refresh: bool = False) -> dict[
         alert_settings=alert_settings,
     )
 
-    return {
+    snapshot = {
         "generated_at": datetime.now(tz=ZoneInfo("UTC")).isoformat(),
         "generated_at_local": now_local.strftime("%Y-%m-%d %H:%M:%S %Z"),
         "timezone": tz_name,
@@ -515,12 +559,16 @@ async def _build_snapshot(days: int, force_today_refresh: bool = False) -> dict[
         "history": [item.to_dict() for item in evals_sorted],
         "recommendation": recommendation,
     }
+    elapsed_ms = int((_time.perf_counter() - start_time) * 1000)
+    log.info("snapshot built days=%d elapsed_ms=%d", days, elapsed_ms)
+    return snapshot
 
 
 async def _build_day_evaluation(
     day: date,
     weather: WeatherDay | None,
     force_refresh_today: bool = False,
+    client: httpx.AsyncClient | None = None,
 ) -> DayEvaluation:
     tz_name = os.getenv("SOLAR_TIMEZONE", DEFAULT_TZ)
     tz = ZoneInfo(tz_name)
@@ -533,6 +581,7 @@ async def _build_day_evaluation(
         response, data_source, fetched_at = await _get_or_fetch_day_response(
             day,
             force_refresh_today=force_refresh_today,
+            client=client,
         )
         points = _parse_power_points(response)
         return _summarize_day(
@@ -672,6 +721,7 @@ def _summarize_day(
 async def _get_or_fetch_day_response(
     day: date,
     force_refresh_today: bool = False,
+    client: httpx.AsyncClient | None = None,
 ) -> tuple[dict[str, Any], str, str | None]:
     day_str = day.isoformat()
     record = await get_day_record(day_str)
@@ -680,7 +730,7 @@ async def _get_or_fetch_day_response(
 
     if is_today and force_refresh_today:
         try:
-            fresh_response = await call_shinemonitor_api(date_override=day_str)
+            fresh_response = await call_shinemonitor_api(date_override=day_str, client=client)
             await upsert_day_success(day_str, fresh_response)
             fresh_record = await get_day_record(day_str)
             return fresh_response, "api", fresh_record.get("fetched_at") if fresh_record else None
@@ -689,9 +739,11 @@ async def _get_or_fetch_day_response(
             if record and record.get("response_json"):
                 try:
                     parsed = json.loads(record["response_json"])
+                    log.warning("day %s using db_stale after api error: %r", day_str, exc)
                     return parsed, "db_stale", record.get("fetched_at")
                 except json.JSONDecodeError:
                     pass
+            log.warning("day %s api error with no cached fallback: %r", day_str, exc)
             raise
 
     if record and record.get("response_json") and not _should_refresh_record(day=day, fetched_at=record.get("fetched_at")):
@@ -702,7 +754,7 @@ async def _get_or_fetch_day_response(
             pass
 
     try:
-        fresh_response = await call_shinemonitor_api(date_override=day_str)
+        fresh_response = await call_shinemonitor_api(date_override=day_str, client=client)
         await upsert_day_success(day_str, fresh_response)
         fresh_record = await get_day_record(day_str)
         return fresh_response, "api", fresh_record.get("fetched_at") if fresh_record else None
@@ -711,9 +763,11 @@ async def _get_or_fetch_day_response(
         if record and record.get("response_json"):
             try:
                 parsed = json.loads(record["response_json"])
+                log.warning("day %s using db_stale after api error: %r", day_str, exc)
                 return parsed, "db_stale", record.get("fetched_at")
             except json.JSONDecodeError:
                 pass
+        log.warning("day %s api error with no cached fallback: %r", day_str, exc)
         raise
 
 
@@ -759,23 +813,33 @@ def _elapsed_daylight_hours(now_local: datetime, sunrise: datetime, sunset: date
     return max((now_local - sunrise).total_seconds() / 3600.0, 0.0)
 
 
-async def _fetch_weather_range(start_day: date, end_day: date, tz_name: str) -> dict[str, WeatherDay]:
+async def _fetch_weather_range(
+    start_day: date,
+    end_day: date,
+    tz_name: str,
+    client: httpx.AsyncClient | None = None,
+) -> tuple[dict[str, WeatherDay], float | None]:
     lat_raw = os.getenv("SOLAR_LATITUDE", "").strip()
     lon_raw = os.getenv("SOLAR_LONGITUDE", "").strip()
     if not lat_raw or not lon_raw:
-        return {}
+        return {}, None
 
     try:
         lat = float(lat_raw)
         lon = float(lon_raw)
     except ValueError:
-        return {}
+        return {}, None
+
+    tz = ZoneInfo(tz_name)
+    today = datetime.now(tz=tz).date()
+    forecast_end = today + timedelta(days=2)
+    extended_end = max(end_day, forecast_end)
 
     params = {
         "latitude": lat,
         "longitude": lon,
         "start_date": start_day.isoformat(),
-        "end_date": end_day.isoformat(),
+        "end_date": extended_end.isoformat(),
         "daily": "sunrise,sunset,precipitation_sum,weather_code,daylight_duration,sunshine_duration",
         "hourly": "cloud_cover",
         "timezone": tz_name,
@@ -783,12 +847,18 @@ async def _fetch_weather_range(start_day: date, end_day: date, tz_name: str) -> 
 
     timeout = float(os.getenv("WEATHER_API_TIMEOUT", "15"))
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.get(WEATHER_URL, params=params)
+        if client is None:
+            async with httpx.AsyncClient(timeout=timeout) as owned:
+                response = await owned.get(WEATHER_URL, params=params, timeout=timeout)
+                response.raise_for_status()
+                payload = response.json()
+        else:
+            response = await client.get(WEATHER_URL, params=params, timeout=timeout)
             response.raise_for_status()
             payload = response.json()
-    except Exception:  # noqa: BLE001
-        return {}
+    except Exception as exc:  # noqa: BLE001
+        log.warning("open-meteo fetch failed: %r", exc)
+        return {}, None
 
     daily = payload.get("daily", {})
     daily_dates = daily.get("time", [])
@@ -801,8 +871,12 @@ async def _fetch_weather_range(start_day: date, end_day: date, tz_name: str) -> 
 
     cloud_map = _build_hourly_cloud_map(payload)
 
-    tz = ZoneInfo(tz_name)
     result: dict[str, WeatherDay] = {}
+    forecast_dates = {
+        (today + timedelta(days=offset)).isoformat() for offset in range(3)
+    }
+    upcoming_rain_values: list[float] = []
+
     for idx, day_value in enumerate(daily_dates):
         sunrise = _parse_iso_dt(_safe_index(sunrise_values, idx), tz)
         sunset = _parse_iso_dt(_safe_index(sunset_values, idx), tz)
@@ -821,48 +895,11 @@ async def _fetch_weather_range(start_day: date, end_day: date, tz_name: str) -> 
             sunshine_hours=sunshine_h,
         )
 
-    return result
+        if day_value in forecast_dates and rain is not None:
+            upcoming_rain_values.append(rain)
 
-
-async def _fetch_upcoming_rain_mm(tz_name: str) -> float | None:
-    lat_raw = os.getenv("SOLAR_LATITUDE", "").strip()
-    lon_raw = os.getenv("SOLAR_LONGITUDE", "").strip()
-    if not lat_raw or not lon_raw:
-        return None
-
-    try:
-        lat = float(lat_raw)
-        lon = float(lon_raw)
-    except ValueError:
-        return None
-
-    tz = ZoneInfo(tz_name)
-    today = datetime.now(tz=tz).date()
-    end_day = today + timedelta(days=2)
-
-    params = {
-        "latitude": lat,
-        "longitude": lon,
-        "start_date": today.isoformat(),
-        "end_date": end_day.isoformat(),
-        "daily": "precipitation_sum",
-        "timezone": tz_name,
-    }
-
-    timeout = float(os.getenv("WEATHER_API_TIMEOUT", "15"))
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.get(WEATHER_URL, params=params)
-            response.raise_for_status()
-            payload = response.json()
-    except Exception:  # noqa: BLE001
-        return None
-
-    rain_values = payload.get("daily", {}).get("precipitation_sum", [])
-    cleaned = [value for value in (_safe_float(item) for item in rain_values) if value is not None]
-    if not cleaned:
-        return None
-    return round(sum(cleaned), 3)
+    upcoming_rain = round(sum(upcoming_rain_values), 3) if upcoming_rain_values else None
+    return result, upcoming_rain
 
 
 def _build_hourly_cloud_map(payload: dict[str, Any]) -> dict[str, float]:
@@ -1042,33 +1079,6 @@ def _build_recommendation(
         "baseline_kwh": baseline_kwh,
         "upcoming_rain_mm": upcoming_rain_mm,
     }
-
-
-async def _build_status_uncached() -> str:
-    snapshot = await get_snapshot(days=7, use_cache=False)
-    today = snapshot["today"]
-    rec = snapshot["recommendation"]
-    return "\n".join(
-        [
-            "Solar Monitor - Status (fresh)",
-            f"Generated at: {snapshot['generated_at_local']}",
-            f"Current Output: {_fmt(today.get('current_output_kw'), 'kW')}",
-            f"Energy Today (est): {_fmt(today.get('energy_estimate_kwh'), 'kWh')}",
-            f"Decision: {rec.get('summary', 'n/a')}",
-        ]
-    )
-
-
-async def _build_history_uncached(days: int) -> str:
-    snapshot = await get_snapshot(days=days, use_cache=False)
-    rec = snapshot["recommendation"]
-    return "\n".join(
-        [
-            f"Solar Monitor - History ({days}d, fresh)",
-            f"Decision: {rec.get('summary', 'n/a')}",
-            f"Coverage: {len([d for d in snapshot['history'][:days] if not d.get('error')])}/{days}",
-        ]
-    )
 
 
 def _count_low_clear_streak(history: list[DayEvaluation], baseline_kwh: float | None) -> int:
